@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+
+# Project specific
+.python-certs/
+skill-index.md
+
+# OS
+.DS_Store
+Thumbs.db
