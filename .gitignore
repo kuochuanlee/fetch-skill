@@ -7,7 +7,7 @@ __pycache__/
 
 # Project specific
 .python-certs/
-skills.json
+index.json
 downloads/
 
 # OS

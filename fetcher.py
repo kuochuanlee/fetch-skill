@@ -8,8 +8,17 @@ import sys
 import tempfile
 import shutil
 import threading
+import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# 設定 logging 配置，確保導向 stderr 以免污染 MCP 的 stdout
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stderr
+)
 
 
 # 強制設定標準輸出編碼為 UTF-8，解決 Windows 終端機亂碼問題
@@ -25,7 +34,7 @@ if sys.stdout.encoding != 'utf-8':
 
 # 設定專案全域變數
 SEED_URL = "https://raw.githubusercontent.com/VoltAgent/awesome-agent-skills/main/README.md"
-DATA_FILE = "skills.json"
+DATA_FILE = "index.json"
 MAX_WORKERS = 15
 MAX_DESC_LENGTH = 1000
 RETRY_SUCCESS_AFTER_DAYS = 15  # 成功項目每 15 天刷新一次
@@ -64,7 +73,7 @@ def get_ssl_context():
         if os.path.exists(cert_path):
             context.load_verify_locations(cafile=cert_path)
         else:
-            print("Warning: Custom certificate not found, using system default SSL context")
+            logging.warning("Custom certificate not found, using system default SSL context")
 
         _SSL_CONTEXT = context
         return context
@@ -81,6 +90,10 @@ def normalize_url(url):
 
 
 def github_to_raw(url):
+    # 判斷是否為合法 URL 格式
+    if not url or not (url.startswith('http://') or url.startswith('https://')):
+        return url, False
+
     # 判斷是否為 GitHub 連結
     if "github.com" not in url:
         return url, False
@@ -103,7 +116,11 @@ def fetch_content(url):
 
         with urllib.request.urlopen(req, timeout=10, context=get_ssl_context()) as response:
             return response.read().decode('utf-8')
-    except Exception:
+    except urllib.error.HTTPError as e:
+        logging.error(f"HTTP {e.code}: {url}")
+        return None
+    except Exception as e:
+        logging.error(f"Failed to fetch {url}: {str(e)}")
         return None
 
 
@@ -258,10 +275,12 @@ def download_skill_recursive(
     if not content:
         return
 
-    # 確保路徑安全性
-    local_path = os.path.join(target_dir, filename.lstrip('/').replace("/", os.sep))
+    # 確保路徑安全性 (防止路徑穿越攻擊)
+    local_path = os.path.abspath(os.path.join(target_dir, filename.lstrip('/').replace("/", os.sep)))
+    target_abs_dir = os.path.abspath(target_dir)
 
-    if not os.path.realpath(local_path).startswith(os.path.realpath(target_dir)):
+    if not local_path.startswith(target_abs_dir):
+        logging.warning(f"Path traversal blocked: {filename}")
         return
 
     # 建立目錄並寫入檔案
@@ -270,7 +289,7 @@ def download_skill_recursive(
     with open(local_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    print(f"  [+] Downloaded: {filename}")
+    logging.info(f"  [+] Downloaded: {filename}")
 
     # 遞迴下載連結的文件
     if filename.lower().endswith(".md"):
@@ -293,21 +312,19 @@ def download_skill_recursive(
             )
 
 
-def download_skill(skill_id):
+def fetch(skill_id):
     # 檢查資料檔案是否存在
     if not os.path.exists(DATA_FILE):
-        print("Error: Data file not found, please run update first")
-        return
+        raise FileNotFoundError(f"Data file {DATA_FILE} not found. Please run update first.")
 
     try:
         # 驗證 ID 合法性
         target_id = int(skill_id)
 
         if target_id <= 0:
-            raise ValueError
+            raise ValueError("skill_id must be a positive integer.")
     except (ValueError, TypeError):
-        print(f"Error: skill_id must be a positive integer")
-        return
+        raise ValueError("skill_id must be a positive integer.")
 
     # 讀取現有資料
     with open(DATA_FILE, 'r', encoding='utf-8') as f:
@@ -316,17 +333,16 @@ def download_skill(skill_id):
     skill = next((s for s in skills if s['id'] == target_id), None)
 
     if not skill:
-        print(f"Error: Item with ID {target_id} not found")
-        return
+        raise ValueError(f"Item with ID {target_id} not found.")
 
     # 準備下載目錄
     target_dir = os.path.join("downloads", re.sub(r'[\\/:*?"<>|.]', '_', skill['name']))
 
     if not os.path.realpath(target_dir).startswith(os.path.realpath("downloads")):
-        return
+        raise PermissionError("Target directory is outside of downloads folder.")
 
     os.makedirs(target_dir, exist_ok=True)
-    print(f"Fetching Skill: {skill['name']}...")
+    logging.info(f"Fetching Skill: {skill['name']}...")
     processed_files = set()
 
     # 執行下載
@@ -350,7 +366,7 @@ def download_skill(skill_id):
             processed_files
         )
 
-    print(f"Fetch completed!")
+    logging.info(f"Fetch completed!")
 
 
 def safe_json_write(
@@ -368,7 +384,7 @@ def safe_json_write(
         # 原子性移動檔案
         shutil.move(tmp_path, path)
     except Exception as e:
-        print(f"Error: Failed to safely write JSON file {path}: {e}")
+        logging.error(f"Failed to safely write JSON file {path}: {e}")
 
         # 清理殘留的暫存檔
         if os.path.exists(tmp_path):
@@ -378,8 +394,8 @@ def safe_json_write(
         raise
 
 
-def update_data():
-    print("[Incremental Update] Starting update...")
+def update():
+    logging.info("[Incremental Update] Starting update...")
     existing_map = {}
 
     # 讀取既有的資料庫
@@ -434,13 +450,13 @@ def update_data():
             final_results.append(existing.copy())
             hit_count += 1
 
-    print(f"[Status] Cache hit: {hit_count}, To scan: {len(to_scan)}")
+    logging.info(f"[Status] Cache hit: {hit_count}, To scan: {len(to_scan)}")
 
     # 執行多執行緒掃描
     if to_scan:
         total_tasks = len(to_scan)
         completed_count = 0
-        print(f"[Action] Starting deep scan ({total_tasks} items)...")
+        logging.info(f"[Action] Starting deep scan ({total_tasks} items)...")
         scanned_map = {}
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -456,7 +472,7 @@ def update_data():
 
                 # 顯示掃描進度
                 status_str = "[FAIL]" if res.get('scan_failed') else "[OK]"
-                print(f"  [{completed_count}/{total_tasks}] {status_str}: {res['name']}")
+                logging.info(f"  [{completed_count}/{total_tasks}] {status_str}: {res['name']}")
 
         # 整合掃描結果與原始列表
         final_results = [
@@ -469,7 +485,7 @@ def update_data():
         skill['id'] = idx + 1
 
     safe_json_write(DATA_FILE, final_results)
-    print(f"[Done] Update completed. Data saved.")
+    logging.info(f"[Done] Update completed. Data saved.")
 
 
 def main():
@@ -478,11 +494,14 @@ def main():
         cmd = sys.argv[1].lower()
 
         if cmd == "fetch" and len(sys.argv) > 2:
-            download_skill(sys.argv[2])
+            try:
+                fetch(sys.argv[2])
+            except Exception as e:
+                logging.error(str(e))
         elif cmd == "update":
-            update_data()
+            update()
     else:
-        update_data()
+        update()
 
 
 if __name__ == "__main__":
