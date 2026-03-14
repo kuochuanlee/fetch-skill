@@ -7,214 +7,483 @@ import json
 import sys
 import tempfile
 import shutil
+import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 設定
+
+# 強制設定標準輸出編碼為 UTF-8，解決 Windows 終端機亂碼問題
+if sys.stdout.encoding != 'utf-8':
+    try:
+        # Python 3.7+ 支援 reconfigure
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        # 舊版本 Python 備用方案
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+
+# 設定專案全域變數
 SEED_URL = "https://raw.githubusercontent.com/VoltAgent/awesome-agent-skills/main/README.md"
 DATA_FILE = "skills.json"
 MAX_WORKERS = 15
 MAX_DESC_LENGTH = 1000
-RETRY_FAILED_AFTER_DAYS = 7  # 失敗項目每 7 天才重試一次
+RETRY_SUCCESS_AFTER_DAYS = 15  # 成功項目每 15 天刷新一次
+RETRY_FAILED_AFTER_DAYS = 3    # 失敗項目每 3 天重試一次
 DEBUG = False
 
-# 全域快取
+
+# 全域快取與鎖定機制
 _SSL_CONTEXT = None
+_SSL_LOCK = threading.Lock()
+
 
 def get_ssl_context():
     global _SSL_CONTEXT
+
+    # 快速檢查是否已有快取
     if _SSL_CONTEXT is not None:
         return _SSL_CONTEXT
-    user_home = os.path.expanduser('~')
-    cert_path = os.path.join(user_home, '.python-certs', 'cacert.pem')
-    context = ssl.create_default_context()
-    if os.path.exists(cert_path):
-        context.load_verify_locations(cafile=cert_path)
-    else:
-        print("警告: 自訂憑證不存在，將使用系統預設 SSL 憑證")
-    _SSL_CONTEXT = context
-    return context
+
+    # 使用鎖定確保執行緒安全
+    with _SSL_LOCK:
+        # 再次檢查，防止雙重初始化
+        if _SSL_CONTEXT is not None:
+            return _SSL_CONTEXT
+
+        # 設定憑證路徑
+        user_home = os.path.expanduser('~')
+        cert_path = os.path.join(
+            user_home,
+            '.python-certs',
+            'cacert.pem'
+        )
+        context = ssl.create_default_context()
+
+        # 載入自訂或系統憑證
+        if os.path.exists(cert_path):
+            context.load_verify_locations(cafile=cert_path)
+        else:
+            print("Warning: Custom certificate not found, using system default SSL context")
+
+        _SSL_CONTEXT = context
+        return context
+
 
 def normalize_url(url):
-    if not url: return ""
+    # 處理空的 URL
+    if not url:
+        return ""
+
+    # 移除 GitHub 特有的分支路徑
     url = re.sub(r'/(?:tree|blob)/(?:main|master)', '', url)
     return url.rstrip("/").lower()
 
+
 def github_to_raw(url):
-    if "github.com" not in url: return url, False
+    # 判斷是否為 GitHub 連結
+    if "github.com" not in url:
+        return url, False
+
+    # 判斷是否直接指向檔案
     is_file = url.lower().endswith(('.md', '.json', '.txt'))
+
+    # 轉換為 raw 內容連結
     raw_url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/").replace("/tree/", "/")
     return raw_url.rstrip("/"), is_file
 
+
 def fetch_content(url):
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        # 建立請求並獲取內容
+        req = urllib.request.Request(
+            url,
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+
         with urllib.request.urlopen(req, timeout=10, context=get_ssl_context()) as response:
             return response.read().decode('utf-8')
-    except Exception: return None
+    except Exception:
+        return None
 
-def _process_skill_content(skill_dict, content):
+
+def _process_skill_content(
+    skill_dict,
+    content
+):
+    # 解析標題
     title_match = re.search(r'^#\s+(.*)', content, re.M)
-    if title_match: skill_dict['name'] = title_match.group(1).strip()
+
+    if title_match:
+        skill_dict['name'] = title_match.group(1).strip()
+
+    # 解析功能描述
     features_match = re.search(r'##\s+(?:Features|Functions|Tools|功能)(.*?)(?=##|$)', content, re.S | re.I)
+
     if features_match:
         desc = features_match.group(1).strip()
         desc = re.sub(r'[\r\n]+', ' ', desc)
         desc = re.sub(r'[*#>`-]', '', desc)
         desc = re.sub(r'\s{2,}', ' ', desc).strip()
         skill_dict['description'] = desc[:MAX_DESC_LENGTH]
+
+    # 更新掃描狀態
     skill_dict['deep_scanned'] = True
     skill_dict['scan_failed'] = False
     skill_dict['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return skill_dict
 
+
 def extract_deep_info(skill):
     result = skill.copy()
     base_raw_url, is_direct_file = github_to_raw(result['url'])
+
+    # 如果是直接連結到檔案，直接抓取
     if is_direct_file:
         content = fetch_content(base_raw_url)
-        if content: return _process_skill_content(result, content)
 
-    base_candidates = [base_raw_url] if len(base_raw_url.split("/")) > 5 else [f"{base_raw_url}/main", f"{base_raw_url}/master"]
+        if content:
+            return _process_skill_content(result, content)
+
+    # 嘗試多種可能的文件路徑
+    if len(base_raw_url.split("/")) > 5:
+        base_candidates = [base_raw_url]
+    else:
+        base_candidates = [f"{base_raw_url}/main", f"{base_raw_url}/master"]
+
     for current_base in base_candidates:
         for filename in ["/SKILL.md", "/README.md", "/index.md"]:
             content = fetch_content(current_base + filename)
-            if content: return _process_skill_content(result, content)
-    
+
+            if content:
+                return _process_skill_content(result, content)
+
     # 掃描失敗處理：標記為已掃描但失敗，避免下次立即重試
     result['deep_scanned'] = True
     result['scan_failed'] = True
     result['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return result
 
-def should_retry_failed(skill):
-    """判斷失敗項目是否已過冷卻期"""
-    updated_at = skill.get('updated_at')
-    if not updated_at: return True
-    try:
-        last_time = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
-        return (datetime.now() - last_time).days >= RETRY_FAILED_AFTER_DAYS
-    except ValueError: return True
 
 def parse_main_readme(content):
     skills = []
     pattern = r'\[(.*?)\]\((https?://github\.com/.*?)\)(.*)'
     matches = re.finditer(pattern, content)
     seen_urls = set()
+
+    # 疊代解析所有的連結
     for match in matches:
-        name, url, desc_part = match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
-        if any(x in url.lower() for x in ["badge", "img.shields.io", "github.com/voltagent/awesome-agent-skills"]): continue
+        name = match.group(1).strip()
+        url = match.group(2).strip()
+        desc_part = match.group(3).strip()
+
+        # 過濾不需要的連結
+        if any(x in url.lower() for x in ["badge", "img.shields.io", "github.com/voltagent/awesome-agent-skills"]):
+            continue
+
         norm_url = normalize_url(url)
-        if norm_url in seen_urls: continue
+
+        if norm_url in seen_urls:
+            continue
+
         seen_urls.add(norm_url)
+
         try:
+            # 解析 GitHub 使用者資訊
             parsed = urlparse(url)
             path_parts = parsed.path.strip('/').split('/')
-            github_user = path_parts[0] if path_parts else "Unknown"
-        except Exception: github_user = "Unknown"
-        skills.append({"name": name, "url": url, "github_user": github_user, "description": re.sub(r'<.*?>', '', desc_part).strip(), "source": url.rstrip('/').split("/")[-2] + "/" + url.rstrip('/').split("/")[-1] if len(url.rstrip('/').split("/")) > 1 else url, "category": "General", "deep_scanned": False, "updated_at": None})
+
+            if path_parts:
+                github_user = path_parts[0]
+            else:
+                github_user = "Unknown"
+        except Exception:
+            github_user = "Unknown"
+
+        # 整理來源資訊
+        url_parts = url.rstrip('/').split("/")
+
+        if len(url_parts) > 1:
+            source = url_parts[-2] + "/" + url_parts[-1]
+        else:
+            source = url
+
+        # 建立技能資料字典
+        skills.append({
+            "name": name,
+            "url": url,
+            "github_user": github_user,
+            "description": re.sub(r'<.*?>', '', desc_part).strip(),
+            "source": source,
+            "category": "General",
+            "deep_scanned": False,
+            "updated_at": None
+        })
+
     return skills
 
-def download_skill_recursive(base_raw_url, target_dir, filename, current_depth=0, max_depth=1, processed_files=None):
-    if processed_files is None: processed_files = set()
-    if current_depth > max_depth or filename in processed_files: return
+
+def download_skill_recursive(
+    base_raw_url,
+    target_dir,
+    filename,
+    current_depth=0,
+    max_depth=1,
+    processed_files=None
+):
+    # 初始化處理過的檔案記錄
+    if processed_files is None:
+        processed_files = set()
+
+    # 深度與重複檢查
+    if current_depth > max_depth or filename in processed_files:
+        return
+
     processed_files.add(filename)
     base_raw, is_file = github_to_raw(base_raw_url)
     content = None
-    if is_file and current_depth == 0: content = fetch_content(base_raw)
+
+    # 根據不同情境嘗試獲取內容
+    if is_file and current_depth == 0:
+        content = fetch_content(base_raw)
     elif len(base_raw.split("/")) <= 5:
         for br in ["main", "master"]:
             content = fetch_content(f"{base_raw}/{br}/{filename.lstrip('/')}")
-            if content: break
-    else: content = fetch_content(f"{base_raw}/{filename.lstrip('/')}")
-    if not content: return
+
+            if content:
+                break
+    else:
+        content = fetch_content(f"{base_raw}/{filename.lstrip('/')}")
+
+    if not content:
+        return
+
+    # 確保路徑安全性
     local_path = os.path.join(target_dir, filename.lstrip('/').replace("/", os.sep))
-    if not os.path.realpath(local_path).startswith(os.path.realpath(target_dir)): return
+
+    if not os.path.realpath(local_path).startswith(os.path.realpath(target_dir)):
+        return
+
+    # 建立目錄並寫入檔案
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    with open(local_path, "w", encoding="utf-8") as f: f.write(content)
-    print(f"  [+] 已下載: {filename}")
+
+    with open(local_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    print(f"  [+] Downloaded: {filename}")
+
+    # 遞迴下載連結的文件
     if filename.lower().endswith(".md"):
         links = set(re.findall(r'\[.*?\]\((?!https?://)(.*?\.md)\)', content) + re.findall(r'(?:^|\s|\"|\')([a-zA-Z0-9_\-\./]+\.md)(?:\s|\"|\'|$)', content, re.M))
+
         for link in links:
             link_clean = link.split("#")[0].strip()
-            if link_clean.startswith("/") or "://" in link_clean: continue
+
+            if link_clean.startswith("/") or "://" in link_clean:
+                continue
+
             new_filename = os.path.normpath(os.path.join(os.path.dirname(filename), link_clean)).replace(os.sep, "/")
-            download_skill_recursive(base_raw_url, target_dir, new_filename, current_depth + 1, max_depth, processed_files)
+            download_skill_recursive(
+                base_raw_url,
+                target_dir,
+                new_filename,
+                current_depth + 1,
+                max_depth,
+                processed_files
+            )
+
 
 def download_skill(skill_id):
-    if not os.path.exists(DATA_FILE): return print("錯誤: 找不到數據檔案，請先執行 update")
-    try:
-        target_id = int(skill_id)
-        if target_id <= 0: raise ValueError
-    except (ValueError, TypeError): return print(f"錯誤: skill_id 必須為正整數")
-    with open(DATA_FILE, 'r', encoding='utf-8') as f: skills = json.load(f)
-    skill = next((s for s in skills if s['id'] == target_id), None)
-    if not skill: return print(f"錯誤: 找不到編號為 {target_id} 的項目")
-    target_dir = os.path.join("downloads", re.sub(r'[\\/:*?"<>|.]', '_', skill['name']))
-    if not os.path.realpath(target_dir).startswith(os.path.realpath("downloads")): return
-    os.makedirs(target_dir, exist_ok=True)
-    print(f"正在深度抓取 Skill: {skill['name']}...")
-    processed_files = set()
-    if skill['url'].lower().endswith('.md'): download_skill_recursive(skill['url'], target_dir, os.path.basename(skill['url']), 0, 1, processed_files)
-    for entry in ["SKILL.md", "README.md", "index.md"]: download_skill_recursive(skill['url'], target_dir, entry, 0, 1, processed_files)
-    print(f"深度抓取完成！")
+    # 檢查資料檔案是否存在
+    if not os.path.exists(DATA_FILE):
+        print("Error: Data file not found, please run update first")
+        return
 
-def safe_json_write(path, data):
+    try:
+        # 驗證 ID 合法性
+        target_id = int(skill_id)
+
+        if target_id <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        print(f"Error: skill_id must be a positive integer")
+        return
+
+    # 讀取現有資料
+    with open(DATA_FILE, 'r', encoding='utf-8') as f:
+        skills = json.load(f)
+
+    skill = next((s for s in skills if s['id'] == target_id), None)
+
+    if not skill:
+        print(f"Error: Item with ID {target_id} not found")
+        return
+
+    # 準備下載目錄
+    target_dir = os.path.join("downloads", re.sub(r'[\\/:*?"<>|.]', '_', skill['name']))
+
+    if not os.path.realpath(target_dir).startswith(os.path.realpath("downloads")):
+        return
+
+    os.makedirs(target_dir, exist_ok=True)
+    print(f"Fetching Skill: {skill['name']}...")
+    processed_files = set()
+
+    # 執行下載
+    if skill['url'].lower().endswith('.md'):
+        download_skill_recursive(
+            skill['url'],
+            target_dir,
+            os.path.basename(skill['url']),
+            0,
+            1,
+            processed_files
+        )
+
+    for entry in ["SKILL.md", "README.md", "index.md"]:
+        download_skill_recursive(
+            skill['url'],
+            target_dir,
+            entry,
+            0,
+            1,
+            processed_files
+        )
+
+    print(f"Fetch completed!")
+
+
+def safe_json_write(
+    path,
+    data
+):
+    # 使用暫存檔安全寫入 JSON
     dir_name = os.path.dirname(os.path.abspath(path))
+
     with tempfile.NamedTemporaryFile(mode='w', dir=dir_name, delete=False, encoding='utf-8') as tmp:
         json.dump(data, tmp, ensure_ascii=False, indent=2)
         tmp_path = tmp.name
-    try: shutil.move(tmp_path, path)
-    except Exception:
-        if os.path.exists(tmp_path): os.remove(tmp_path)
+
+    try:
+        # 原子性移動檔案
+        shutil.move(tmp_path, path)
+    except Exception as e:
+        print(f"Error: Failed to safely write JSON file {path}: {e}")
+
+        # 清理殘留的暫存檔
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+        # 重新拋出異常，讓呼叫端知曉失敗
+        raise
+
 
 def update_data():
-    print("[Incremental Update] 開始執行增量更新 (含失敗冷卻機制)...")
+    print("[Incremental Update] Starting update...")
     existing_map = {}
+
+    # 讀取既有的資料庫
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
                 existing_map = {normalize_url(s['url']): s for s in json.load(f)}
-        except Exception: pass
+        except Exception:
+            pass
+
+    # 抓取主要 README 內容
     main_content = fetch_content(SEED_URL)
-    if not main_content: return
+
+    if not main_content:
+        return
+
     new_list = parse_main_readme(main_content)
     to_scan, final_results, hit_count = [], [], 0
+
+    # 比對並過濾需要更新的項目
     for skill in new_list:
         norm_url = normalize_url(skill['url'])
         existing = existing_map.get(norm_url)
+
+        # 判斷是否需要重新掃描
+        need_re_scan = True
+
         if existing and existing.get('deep_scanned'):
-            # 如果上次掃描失敗，且還在冷卻期內，則跳過重試，直接用舊的（失敗標記）資料
-            if existing.get('scan_failed') and should_retry_failed(existing):
-                to_scan.append(skill)
-                final_results.append(skill)
+            updated_at = existing.get('updated_at')
+            days_passed = 999  # Forced re-scan if date is missing
+
+            if updated_at:
+                try:
+                    last_time = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+                    days_passed = (datetime.now() - last_time).days
+                except ValueError:
+                    pass
+
+            if existing.get('scan_failed'):
+                # Failed: Cache for 3 days
+                if days_passed < RETRY_FAILED_AFTER_DAYS:
+                    need_re_scan = False
             else:
-                final_results.append(existing.copy())
-                hit_count += 1
-        else:
+                # Success: Cache for 15 days
+                if days_passed < RETRY_SUCCESS_AFTER_DAYS:
+                    need_re_scan = False
+
+        if need_re_scan:
             to_scan.append(skill)
             final_results.append(skill)
-    print(f"📊 增量狀態: 快取命中 {hit_count} 項，需掃描 {len(to_scan)} 項。")
+        else:
+            final_results.append(existing.copy())
+            hit_count += 1
+
+    print(f"[Status] Cache hit: {hit_count}, To scan: {len(to_scan)}")
+
+    # 執行多執行緒掃描
     if to_scan:
-        print(f"🚀 開始深度掃描...")
+        total_tasks = len(to_scan)
+        completed_count = 0
+        print(f"[Action] Starting deep scan ({total_tasks} items)...")
         scanned_map = {}
+
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_url = {executor.submit(extract_deep_info, s): normalize_url(s['url']) for s in to_scan}
+            future_to_url = {
+                executor.submit(extract_deep_info, s): normalize_url(s['url'])
+                for s in to_scan
+            }
+
             for future in as_completed(future_to_url):
+                completed_count += 1
                 res = future.result()
                 scanned_map[normalize_url(res['url'])] = res
-        for i, s in enumerate(final_results):
-            nu = normalize_url(s['url'])
-            if nu in scanned_map: final_results[i] = scanned_map[nu]
-    for idx, skill in enumerate(final_results): skill['id'] = idx + 1
+
+                # 顯示掃描進度
+                status_str = "[FAIL]" if res.get('scan_failed') else "[OK]"
+                print(f"  [{completed_count}/{total_tasks}] {status_str}: {res['name']}")
+
+        # 整合掃描結果與原始列表
+        final_results = [
+            scanned_map.get(normalize_url(s['url']), s)
+            for s in final_results
+        ]
+
+    # 重編 ID 並儲存
+    for idx, skill in enumerate(final_results):
+        skill['id'] = idx + 1
+
     safe_json_write(DATA_FILE, final_results)
-    print(f"🎉 更新完成！數據已儲存。")
+    print(f"[Done] Update completed. Data saved.")
+
 
 def main():
+    # 根據命令列參數決定執行行為
     if len(sys.argv) > 1:
         cmd = sys.argv[1].lower()
-        if cmd == "fetch" and len(sys.argv) > 2: download_skill(sys.argv[2])
-        elif cmd == "update": update_data()
-    else: update_data()
 
-if __name__ == "__main__": main()
+        if cmd == "fetch" and len(sys.argv) > 2:
+            download_skill(sys.argv[2])
+        elif cmd == "update":
+            update_data()
+    else:
+        update_data()
+
+
+if __name__ == "__main__":
+    main()
