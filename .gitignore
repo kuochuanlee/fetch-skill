@@ -7,7 +7,8 @@ __pycache__/
 
 # Project specific
 .python-certs/
-skill-index.md
+skills.json
+downloads/
 
 # OS
 .DS_Store
