@@ -34,7 +34,7 @@ if sys.stdout.encoding != 'utf-8':
 
 # 設定專案全域變數
 SEED_URL = "https://raw.githubusercontent.com/VoltAgent/awesome-agent-skills/main/README.md"
-DATA_FILE = "index.json"
+DATA_FILE = "skill-index.json"
 MAX_WORKERS = 15
 MAX_DESC_LENGTH = 1000
 RETRY_SUCCESS_AFTER_DAYS = 15  # 成功項目每 15 天刷新一次
@@ -369,6 +369,59 @@ def fetch(skill_id):
     logging.info(f"Fetch completed!")
 
 
+def fetchall():
+    import time
+    if not os.path.exists(DATA_FILE):
+        raise FileNotFoundError(f"Data file {DATA_FILE} not found. Please run update first.")
+
+    with open(DATA_FILE, 'r', encoding='utf-8') as f:
+        skills = json.load(f)
+
+    total = len(skills)
+    logging.info(f"Starting fetchall for {total} skills. (Sequential download to avoid rate limits)")
+
+    for idx, skill in enumerate(skills, 1):
+        logging.info(f"[{idx}/{total}] Processing ID {skill['id']}: {skill['name']}...")
+        try:
+            fetch(skill['id'])
+        except Exception as e:
+            logging.error(f"Failed to fetch ID {skill['id']}: {e}")
+        time.sleep(0.5)
+
+    logging.info("[Done] Fetchall completed.")
+
+
+def generate_markdown_index(skills):
+    md_path = "skill-index.md"
+    lines = [
+        "# AI Agent Skills Index",
+        "",
+        "> 此檔案由 `fetcher.py update` 自動產生，請隨時依此查閱最新的技能清單。",
+        "",
+        "| ID | 名稱 (Name) | 作者 (Author) | 說明 (Description) |",
+        "|---|---|---|---|"
+    ]
+    
+    for s in skills:
+        id_str = str(s.get('id', ''))
+        name = str(s.get('name', '')).replace('|', '&#124;')
+        url = str(s.get('url', ''))
+        name_link = f"[{name}]({url})" if url else name
+        author = str(s.get('github_user', '')).replace('|', '&#124;')
+        desc_raw = str(s.get('description', '')).replace('\n', ' ').replace('\r', '')
+        desc = desc_raw[:150] + ('...' if len(desc_raw) > 150 else '')
+        desc = desc.replace('|', '&#124;')
+        
+        lines.append(f"| {id_str} | {name_link} | {author} | {desc} |")
+        
+    try:
+        with open(md_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+        logging.info(f"[Done] Generated markdown index at {md_path}")
+    except Exception as e:
+        logging.error(f"Failed to generate markdown index: {e}")
+
+
 def safe_json_write(
     path,
     data
@@ -485,6 +538,7 @@ def update():
         skill['id'] = idx + 1
 
     safe_json_write(DATA_FILE, final_results)
+    generate_markdown_index(final_results)
     logging.info(f"[Done] Update completed. Data saved.")
 
 
@@ -500,6 +554,11 @@ def main():
                 logging.error(str(e))
         elif cmd == "update":
             update()
+        elif cmd == "fetchall":
+            try:
+                fetchall()
+            except Exception as e:
+                logging.error(str(e))
     else:
         update()
 

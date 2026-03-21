@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from filelock import FileLock, Timeout  # pip install filelock
 from mcp.server.fastmcp import FastMCP
 import fetcher
@@ -94,6 +95,30 @@ def fetch(skill_id: int) -> dict:
     except Exception as e:
         logging.error(f"fetch({skill_id}) failed: {e}")
         return {"error": str(e)}
+
+
+@mcp.tool()
+def fetchall() -> dict:
+    """
+    循序下載所有已索引的技能文件到本地 downloads/ 目錄，以避免觸發 GitHub 頻率限制。
+    注意：此為背景執行任務，總耗時可能長達數分鐘。
+    """
+    if not os.path.exists(fetcher.DATA_FILE):
+        return {"error": "Data file not found. Please run update first."}
+
+    def background_fetchall():
+        try:
+            fetcher.fetchall()
+        except Exception as e:
+            logging.error(f"Background fetchall failed: {e}")
+
+    thread = threading.Thread(target=background_fetchall, daemon=True)
+    thread.start()
+    
+    return {
+        "status": "ok", 
+        "message": "Background fetchall task started. Please check the server logs for progress (estimated a few minutes)."
+    }
 
 
 if __name__ == "__main__":
